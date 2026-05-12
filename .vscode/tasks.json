@@ -1,0 +1,54 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Gradle: Clean",
+            "type": "shell",
+            "command": "./gradlew clean",
+            "problemMatcher": []
+        },
+        {
+            "label": "Gradle: Build Debug",
+            "type": "shell",
+            "command": "./gradlew assembleDebug",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Gradle: Install Debug",
+            "type": "shell",
+            "command": "./gradlew installDebug",
+            "problemMatcher": []
+        },
+        {
+            "label": "ADB: Launch App",
+            "type": "shell",
+            "command": "adb shell monkey -p com.duongtc.blerepeaterlab 1",
+            "problemMatcher": []
+        },
+        {
+            "label": "ADB: Uninstall App",
+            "type": "shell",
+            "command": "adb uninstall com.duongtc.blerepeaterlab",
+            "problemMatcher": []
+        },
+        {
+            "label": "Gradle: Build Release APK",
+            "type": "shell",
+            "command": "./gradlew assembleRelease",
+            "problemMatcher": []
+        },
+        {
+            "label": "Gradle: Build Play Store AAB",
+            "type": "shell",
+            "command": "./gradlew bundleRelease",
+            "problemMatcher": []
+        },
+        {
+            "label": "ADB: Logcat App",
+            "type": "shell",
+            "command": "adb logcat -s BleRepeaterLab",
+            "problemMatcher": []
+        }
+    ]
+}
