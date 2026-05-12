@@ -15,9 +15,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-/**
- * ViewModel chính quản lý trạng thái của ứng dụng.
- */
+/** ViewModel chính quản lý trạng thái của ứng dụng. */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val scannerManager = BleScannerManager(application)
@@ -35,37 +33,73 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startScan() {
         scannerManager.startScan()
-        addLog(BleLogEntry(source = LogSource.SCANNER, operation = LogOperation.SCAN_RESULT, message = "Bắt đầu quét"))
+        addLog(
+                BleLogEntry(
+                        source = LogSource.SCANNER,
+                        operation = LogOperation.SCAN_RESULT,
+                        message = "Bắt đầu quét"
+                )
+        )
     }
 
     fun stopScan() {
         scannerManager.stopScan()
-        addLog(BleLogEntry(source = LogSource.SCANNER, operation = LogOperation.SCAN_RESULT, message = "Dừng quét"))
+        addLog(
+                BleLogEntry(
+                        source = LogSource.SCANNER,
+                        operation = LogOperation.SCAN_RESULT,
+                        message = "Dừng quét"
+                )
+        )
     }
 
     fun connectAndCapture(device: BleScanItem) {
         viewModelScope.launch {
-            addLog(BleLogEntry(source = LogSource.REAL_GATT_CLIENT, operation = LogOperation.CONNECT, message = "Kết nối tới ${device.address}"))
-            captureManager.connect(device.address)
+            addLog(
+                    BleLogEntry(
+                            source = LogSource.REAL_GATT_CLIENT,
+                            operation = LogOperation.CONNECT,
+                            message = "Kết nối tới ${device.name ?: device.address}"
+                    )
+            )
+            captureManager.connect(device)
         }
     }
 
     fun disconnectRealDevice() {
         captureManager.disconnect()
         captureManager.close()
-        addLog(BleLogEntry(source = LogSource.REAL_GATT_CLIENT, operation = LogOperation.DISCONNECT, message = "Ngắt kết nối thiết bị thật"))
+        addLog(
+                BleLogEntry(
+                        source = LogSource.REAL_GATT_CLIENT,
+                        operation = LogOperation.DISCONNECT,
+                        message = "Ngắt kết nối thiết bị thật"
+                )
+        )
     }
 
     fun startEmulator(profile: CapturedBleProfile) {
         viewModelScope.launch {
-            addLog(BleLogEntry(source = LogSource.ADVERTISER, operation = LogOperation.START_ADVERTISE, message = "Bắt đầu giả lập"))
+            addLog(
+                    BleLogEntry(
+                            source = LogSource.ADVERTISER,
+                            operation = LogOperation.START_ADVERTISE,
+                            message = "Bắt đầu giả lập"
+                    )
+            )
             emulatorManager.start(profile)
         }
     }
 
     fun stopEmulator() {
         emulatorManager.stop()
-        addLog(BleLogEntry(source = LogSource.ADVERTISER, operation = LogOperation.STOP_ADVERTISE, message = "Dừng giả lập"))
+        addLog(
+                BleLogEntry(
+                        source = LogSource.ADVERTISER,
+                        operation = LogOperation.STOP_ADVERTISE,
+                        message = "Dừng giả lập"
+                )
+        )
     }
 
     fun addLog(entry: BleLogEntry) {
