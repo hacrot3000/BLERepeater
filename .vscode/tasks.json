@@ -5,49 +5,80 @@
             "label": "Gradle: Clean",
             "type": "shell",
             "command": "./gradlew clean",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "Gradle: Build Debug",
             "type": "shell",
             "command": "./gradlew assembleDebug",
-            "group": "build",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "Gradle: Install Debug",
             "type": "shell",
             "command": "./gradlew installDebug",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "ADB: Launch App",
             "type": "shell",
             "command": "adb shell monkey -p com.duongtc.blerepeaterlab 1",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "ADB: Uninstall App",
             "type": "shell",
             "command": "adb uninstall com.duongtc.blerepeaterlab",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "Gradle: Build Release APK",
             "type": "shell",
             "command": "./gradlew assembleRelease",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "Gradle: Build Play Store AAB",
             "type": "shell",
             "command": "./gradlew bundleRelease",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         },
         {
             "label": "ADB: Logcat App",
             "type": "shell",
             "command": "adb logcat -s BleRepeaterLab",
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
             "problemMatcher": []
         }
     ]
