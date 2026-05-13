@@ -17,15 +17,24 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
+import com.duongtc.blerepeaterlab.model.BleLogEntry
 import com.duongtc.blerepeaterlab.model.CapturedBleProfile
 import com.duongtc.blerepeaterlab.model.CapturedGattCharacteristic
 import com.duongtc.blerepeaterlab.model.EmulatorState
+import com.duongtc.blerepeaterlab.model.LogOperation
+import com.duongtc.blerepeaterlab.model.LogSource
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /** Quản lý việc giả lập BLE Peripheral và GATT Server. */
-class BleEmulatorManager(private val context: Context) {
+class BleEmulatorManager(
+        private val context: Context,
+        private val onLog: (BleLogEntry) -> Unit = {}
+) {
 
     private val bluetoothManager =
             context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -41,27 +50,24 @@ class BleEmulatorManager(private val context: Context) {
     /**
      * Cache giá trị characteristic.
      *
-     * Key dùng dạng: serviceUuid|characteristicUuid
-     *
-     * Không dùng riêng characteristicUuid vì một số thiết bị có thể có characteristic UUID trùng ở
-     * nhiều service khác nhau.
+     * Key: serviceUuid|characteristicUuid
      */
     private val characteristicValues = mutableMapOf<String, ByteArray?>()
 
     /**
      * Cache giá trị descriptor.
      *
-     * Key dùng dạng: serviceUuid|characteristicUuid|descriptorUuid
+     * Key: serviceUuid|characteristicUuid|descriptorUuid
      *
-     * Không dùng riêng descriptorUuid vì descriptor như CCCD 00002902-0000-1000-8000-00805f9b34fb
-     * thường xuất hiện ở rất nhiều characteristic, nếu key chỉ là descriptor UUID sẽ bị đè dữ liệu.
+     * Không dùng riêng descriptorUuid vì CCCD 00002902-... có thể xuất hiện ở rất nhiều
+     * characteristic.
      */
     private val descriptorValues = mutableMapOf<String, ByteArray?>()
 
     /**
-     * Lưu trạng thái CCCD theo từng client + từng descriptor.
+     * Cache descriptor theo từng client.
      *
-     * Key dùng dạng: deviceAddress|serviceUuid|characteristicUuid|descriptorUuid
+     * Key: deviceAddress|serviceUuid|characteristicUuid|descriptorUuid
      */
     private val clientDescriptorValues = mutableMapOf<String, ByteArray>()
 
@@ -75,17 +81,32 @@ class BleEmulatorManager(private val context: Context) {
                 ) {
                     super.onConnectionStateChange(device, status, newState)
 
-                    Log.d(
-                            TAG,
-                            "onConnectionStateChange: device=${device.address}, status=$status, newState=$newState"
+                    val stateText =
+                            when (newState) {
+                                BluetoothGatt.STATE_CONNECTED -> "STATE_CONNECTED"
+                                BluetoothGatt.STATE_DISCONNECTED -> "STATE_DISCONNECTED"
+                                BluetoothGatt.STATE_CONNECTING -> "STATE_CONNECTING"
+                                BluetoothGatt.STATE_DISCONNECTING -> "STATE_DISCONNECTING"
+                                else -> "UNKNOWN_STATE_$newState"
+                            }
+
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation =
+                                    if (newState == BluetoothGatt.STATE_CONNECTED) {
+                                        LogOperation.CONNECT
+                                    } else {
+                                        LogOperation.DISCONNECT
+                                    },
+                            statusCode = status,
+                            message =
+                                    "[APP->FAKE] GATT client state changed. client=${safeAddress(device)}, status=$status, newState=$stateText"
                     )
 
                     if (newState == BluetoothGatt.STATE_CONNECTED) {
                         _emulatorState.value = EmulatorState.CLIENT_CONNECTED
-                        Log.d(TAG, "Client đã kết nối: ${device.address}")
                     } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                         _emulatorState.value = EmulatorState.GATT_SERVER_RUNNING
-                        Log.d(TAG, "Client đã ngắt kết nối: ${device.address}")
                     }
                 }
 
@@ -98,12 +119,19 @@ class BleEmulatorManager(private val context: Context) {
                 ) {
                     super.onCharacteristicReadRequest(device, requestId, offset, characteristic)
 
+                    val serviceUuid = characteristic.service?.uuid?.toString()
+                    val charUuid = characteristic.uuid.toString()
                     val key = characteristicKey(characteristic)
                     val fullValue = characteristicValues[key] ?: byteArrayOf()
 
-                    Log.d(
-                            TAG,
-                            "onCharacteristicReadRequest: key=$key, offset=$offset, value=${BlePayloadUtils.bytesToHex(fullValue)}"
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.READ_CHAR,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            payload = fullValue,
+                            message =
+                                    "[APP->FAKE] Read characteristic request. client=${safeAddress(device)}, requestId=$requestId, offset=$offset, key=$key, cachedLen=${fullValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(fullValue)}"
                     )
 
                     if (offset > fullValue.size) {
@@ -113,6 +141,16 @@ class BleEmulatorManager(private val context: Context) {
                                 BluetoothGatt.GATT_INVALID_OFFSET,
                                 offset,
                                 null
+                        )
+
+                        emitLog(
+                                source = LogSource.FAKE_GATT_SERVER,
+                                operation = LogOperation.READ_CHAR,
+                                serviceUuid = serviceUuid,
+                                characteristicUuid = charUuid,
+                                statusCode = BluetoothGatt.GATT_INVALID_OFFSET,
+                                message =
+                                        "[FAKE->APP] Read characteristic response INVALID_OFFSET. client=${safeAddress(device)}, requestId=$requestId, offset=$offset"
                         )
                         return
                     }
@@ -130,6 +168,17 @@ class BleEmulatorManager(private val context: Context) {
                             BluetoothGatt.GATT_SUCCESS,
                             offset,
                             slicedValue
+                    )
+
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.READ_CHAR,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            payload = slicedValue,
+                            statusCode = BluetoothGatt.GATT_SUCCESS,
+                            message =
+                                    "[FAKE->APP] Read characteristic response SUCCESS. client=${safeAddress(device)}, requestId=$requestId, offset=$offset, responseLen=${slicedValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(slicedValue)}"
                     )
                 }
 
@@ -153,11 +202,18 @@ class BleEmulatorManager(private val context: Context) {
                             value
                     )
 
+                    val serviceUuid = characteristic.service?.uuid?.toString()
+                    val charUuid = characteristic.uuid.toString()
                     val key = characteristicKey(characteristic)
 
-                    Log.d(
-                            TAG,
-                            "onCharacteristicWriteRequest: key=$key, preparedWrite=$preparedWrite, responseNeeded=$responseNeeded, offset=$offset, payload=${BlePayloadUtils.bytesToHex(value)}"
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.WRITE_CHAR,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            payload = value,
+                            message =
+                                    "[APP->FAKE] Write characteristic request. client=${safeAddress(device)}, requestId=$requestId, preparedWrite=$preparedWrite, responseNeeded=$responseNeeded, offset=$offset, key=$key, len=${value.size}, utf8=${BlePayloadUtils.tryUtf8Preview(value)}"
                     )
 
                     val oldValue = characteristicValues[key] ?: byteArrayOf()
@@ -168,10 +224,32 @@ class BleEmulatorManager(private val context: Context) {
                                 mergeWriteValue(oldValue, offset, value)
                             }
 
-                    // Giai đoạn hiện tại chỉ cache lại dữ liệu client ghi vào.
-                    // TODO: Sau này bridge payload này sang thiết bị BLE thật nếu cần proxy
-                    // realtime.
                     characteristicValues[key] = newValue
+
+                    emitLog(
+                            source = LogSource.SYSTEM,
+                            operation = LogOperation.WRITE_CHAR,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            payload = newValue,
+                            message =
+                                    "[FAKE CACHE] Characteristic cache updated. key=$key, oldLen=${oldValue.size}, newLen=${newValue.size}"
+                    )
+
+                    /*
+                     * Hiện tại chưa có proxy realtime sang thiết bị thật.
+                     * Log rõ ràng để sau này khi bổ sung bridge có thể so sánh:
+                     * APP->FAKE, FAKE->REAL, REAL->FAKE, FAKE->APP.
+                     */
+                    emitLog(
+                            source = LogSource.REAL_GATT_CLIENT,
+                            operation = LogOperation.WRITE_CHAR,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            payload = value,
+                            message =
+                                    "[FAKE->REAL] NOT_IMPLEMENTED. Payload app gửi chưa được forward sang thiết bị thật."
+                    )
 
                     if (responseNeeded) {
                         gattServer?.sendResponse(
@@ -180,6 +258,17 @@ class BleEmulatorManager(private val context: Context) {
                                 BluetoothGatt.GATT_SUCCESS,
                                 offset,
                                 value
+                        )
+
+                        emitLog(
+                                source = LogSource.FAKE_GATT_SERVER,
+                                operation = LogOperation.WRITE_CHAR,
+                                serviceUuid = serviceUuid,
+                                characteristicUuid = charUuid,
+                                payload = value,
+                                statusCode = BluetoothGatt.GATT_SUCCESS,
+                                message =
+                                        "[FAKE->APP] Write characteristic response SUCCESS. client=${safeAddress(device)}, requestId=$requestId"
                         )
                     }
                 }
@@ -193,6 +282,9 @@ class BleEmulatorManager(private val context: Context) {
                 ) {
                     super.onDescriptorReadRequest(device, requestId, offset, descriptor)
 
+                    val serviceUuid = descriptor.characteristic?.service?.uuid?.toString()
+                    val charUuid = descriptor.characteristic?.uuid?.toString()
+                    val descUuid = descriptor.uuid.toString()
                     val baseKey = descriptorKey(descriptor)
                     val clientKey = clientDescriptorKey(device, descriptor)
 
@@ -201,9 +293,15 @@ class BleEmulatorManager(private val context: Context) {
                                     ?: descriptorValues[baseKey]
                                             ?: defaultDescriptorValue(descriptor)
 
-                    Log.d(
-                            TAG,
-                            "onDescriptorReadRequest: key=$baseKey, client=${device.address}, offset=$offset, value=${BlePayloadUtils.bytesToHex(fullValue)}"
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.READ_DESC,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            descriptorUuid = descUuid,
+                            payload = fullValue,
+                            message =
+                                    "[APP->FAKE] Read descriptor request. client=${safeAddress(device)}, requestId=$requestId, offset=$offset, key=$baseKey, clientKey=$clientKey, len=${fullValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(fullValue)}"
                     )
 
                     if (offset > fullValue.size) {
@@ -213,6 +311,17 @@ class BleEmulatorManager(private val context: Context) {
                                 BluetoothGatt.GATT_INVALID_OFFSET,
                                 offset,
                                 null
+                        )
+
+                        emitLog(
+                                source = LogSource.FAKE_GATT_SERVER,
+                                operation = LogOperation.READ_DESC,
+                                serviceUuid = serviceUuid,
+                                characteristicUuid = charUuid,
+                                descriptorUuid = descUuid,
+                                statusCode = BluetoothGatt.GATT_INVALID_OFFSET,
+                                message =
+                                        "[FAKE->APP] Read descriptor response INVALID_OFFSET. client=${safeAddress(device)}, requestId=$requestId"
                         )
                         return
                     }
@@ -230,6 +339,18 @@ class BleEmulatorManager(private val context: Context) {
                             BluetoothGatt.GATT_SUCCESS,
                             offset,
                             slicedValue
+                    )
+
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.READ_DESC,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            descriptorUuid = descUuid,
+                            payload = slicedValue,
+                            statusCode = BluetoothGatt.GATT_SUCCESS,
+                            message =
+                                    "[FAKE->APP] Read descriptor response SUCCESS. client=${safeAddress(device)}, requestId=$requestId, responseLen=${slicedValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(slicedValue)}"
                     )
                 }
 
@@ -253,12 +374,21 @@ class BleEmulatorManager(private val context: Context) {
                             value
                     )
 
+                    val serviceUuid = descriptor.characteristic?.service?.uuid?.toString()
+                    val charUuid = descriptor.characteristic?.uuid?.toString()
+                    val descUuid = descriptor.uuid.toString()
                     val baseKey = descriptorKey(descriptor)
                     val clientKey = clientDescriptorKey(device, descriptor)
 
-                    Log.d(
-                            TAG,
-                            "onDescriptorWriteRequest: key=$baseKey, client=${device.address}, preparedWrite=$preparedWrite, responseNeeded=$responseNeeded, offset=$offset, payload=${BlePayloadUtils.bytesToHex(value)}"
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.WRITE_DESC,
+                            serviceUuid = serviceUuid,
+                            characteristicUuid = charUuid,
+                            descriptorUuid = descUuid,
+                            payload = value,
+                            message =
+                                    "[APP->FAKE] Write descriptor request. client=${safeAddress(device)}, requestId=$requestId, preparedWrite=$preparedWrite, responseNeeded=$responseNeeded, offset=$offset, key=$baseKey, clientKey=$clientKey, len=${value.size}, utf8=${BlePayloadUtils.tryUtf8Preview(value)}"
                     )
 
                     val oldValue =
@@ -274,11 +404,27 @@ class BleEmulatorManager(private val context: Context) {
 
                     clientDescriptorValues[clientKey] = newValue
 
-                    // Nếu là CCCD thì log rõ client đang bật notify/indicate hay tắt.
                     if (descriptor.uuid == UUID_CCCD) {
-                        Log.d(
-                                TAG,
-                                "CCCD updated: client=${device.address}, value=${describeCccdValue(newValue)}"
+                        emitLog(
+                                source = LogSource.FAKE_GATT_SERVER,
+                                operation = LogOperation.WRITE_DESC,
+                                serviceUuid = serviceUuid,
+                                characteristicUuid = charUuid,
+                                descriptorUuid = descUuid,
+                                payload = newValue,
+                                message =
+                                        "[APP->FAKE] CCCD updated. client=${safeAddress(device)}, state=${describeCccdValue(newValue)}"
+                        )
+                    } else {
+                        emitLog(
+                                source = LogSource.SYSTEM,
+                                operation = LogOperation.WRITE_DESC,
+                                serviceUuid = serviceUuid,
+                                characteristicUuid = charUuid,
+                                descriptorUuid = descUuid,
+                                payload = newValue,
+                                message =
+                                        "[FAKE CACHE] Descriptor client cache updated. client=${safeAddress(device)}, oldLen=${oldValue.size}, newLen=${newValue.size}"
                         )
                     }
 
@@ -290,6 +436,18 @@ class BleEmulatorManager(private val context: Context) {
                                 offset,
                                 value
                         )
+
+                        emitLog(
+                                source = LogSource.FAKE_GATT_SERVER,
+                                operation = LogOperation.WRITE_DESC,
+                                serviceUuid = serviceUuid,
+                                characteristicUuid = charUuid,
+                                descriptorUuid = descUuid,
+                                payload = value,
+                                statusCode = BluetoothGatt.GATT_SUCCESS,
+                                message =
+                                        "[FAKE->APP] Write descriptor response SUCCESS. client=${safeAddress(device)}, requestId=$requestId"
+                        )
                     }
                 }
             }
@@ -300,8 +458,14 @@ class BleEmulatorManager(private val context: Context) {
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                     super.onStartSuccess(settingsInEffect)
 
-                    Log.d(TAG, "Start advertising thành công")
                     _emulatorState.value = EmulatorState.ADVERTISING
+
+                    emitLog(
+                            source = LogSource.ADVERTISER,
+                            operation = LogOperation.START_ADVERTISE,
+                            message =
+                                    "[FAKE ADVERTISER] Start advertising SUCCESS. mode=${settingsInEffect.mode}, txPower=${settingsInEffect.txPowerLevel}, connectable=${settingsInEffect.isConnectable}, timeout=${settingsInEffect.timeout}"
+                    )
                 }
 
                 override fun onStartFailure(errorCode: Int) {
@@ -320,8 +484,15 @@ class BleEmulatorManager(private val context: Context) {
                                 else -> "UNKNOWN"
                             }
 
-                    Log.e(TAG, "Start advertising thất bại: $errorCode / $reason")
                     _emulatorState.value = EmulatorState.ERROR
+
+                    emitLog(
+                            source = LogSource.ADVERTISER,
+                            operation = LogOperation.ERROR,
+                            statusCode = errorCode,
+                            message =
+                                    "[FAKE ADVERTISER] Start advertising FAILED. code=$errorCode, reason=$reason"
+                    )
                 }
             }
 
@@ -329,35 +500,58 @@ class BleEmulatorManager(private val context: Context) {
     fun start(profile: CapturedBleProfile) {
         stop()
 
+        emitLog(
+                source = LogSource.SYSTEM,
+                operation = LogOperation.START_ADVERTISE,
+                message =
+                        "[EMULATOR] Start requested. profileName=${profile.deviceName}, address=${profile.deviceAddress}, services=${profile.services.size}, advertiseServiceUuids=${profile.advertiseServiceUuids}, manufacturerDataCount=${profile.manufacturerData.size}"
+        )
+
         if (bluetoothAdapter == null) {
-            Log.e(TAG, "Bluetooth adapter null")
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    LogSource.SYSTEM,
+                    LogOperation.ERROR,
+                    message = "[EMULATOR] Bluetooth adapter null"
+            )
             return
         }
 
         if (!bluetoothAdapter.isEnabled) {
-            Log.e(TAG, "Bluetooth chưa bật")
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(LogSource.SYSTEM, LogOperation.ERROR, message = "[EMULATOR] Bluetooth chưa bật")
             return
         }
 
         if (!bluetoothAdapter.isMultipleAdvertisementSupported) {
-            Log.e(TAG, "Thiết bị Android này không hỗ trợ BLE advertising")
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    LogSource.SYSTEM,
+                    LogOperation.ERROR,
+                    message = "[EMULATOR] Android device không hỗ trợ multiple BLE advertising"
+            )
             return
         }
 
         advertiser = bluetoothAdapter.bluetoothLeAdvertiser
         if (advertiser == null) {
-            Log.e(TAG, "BluetoothLeAdvertiser null")
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    LogSource.ADVERTISER,
+                    LogOperation.ERROR,
+                    message = "[FAKE ADVERTISER] BluetoothLeAdvertiser null"
+            )
             return
         }
 
         gattServer = bluetoothManager.openGattServer(context, serverCallback)
         if (gattServer == null) {
-            Log.e(TAG, "Không mở được BluetoothGattServer")
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    LogSource.FAKE_GATT_SERVER,
+                    LogOperation.ERROR,
+                    message = "[FAKE GATT] Không mở được BluetoothGattServer"
+            )
             return
         }
 
@@ -370,13 +564,13 @@ class BleEmulatorManager(private val context: Context) {
         val mainServiceUuid =
                 profile.advertiseServiceUuids.firstOrNull() ?: profile.services.firstOrNull()?.uuid
 
-        Log.d(TAG, "Profile deviceName=${profile.deviceName}")
-        Log.d(TAG, "Profile advertiseServiceUuids=${profile.advertiseServiceUuids}")
-        Log.d(TAG, "Profile manufacturerData count=${profile.manufacturerData.size}")
-
         if (mainServiceUuid.isNullOrBlank()) {
-            Log.e(TAG, "Không có service UUID nào để advertise")
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.ERROR,
+                    message = "[FAKE ADVERTISER] Không có service UUID nào để advertise"
+            )
             return
         }
 
@@ -390,17 +584,16 @@ class BleEmulatorManager(private val context: Context) {
                         .setTimeout(0)
                         .build()
 
+        /*
+         * Advertising chính: ưu tiên Service UUID để app chính chủ scan filter thấy.
+         */
         val advertiseDataBuilder =
                 AdvertiseData.Builder().setIncludeDeviceName(false).setIncludeTxPowerLevel(false)
 
-        Log.d(TAG, "Advertise main service UUID=$mainServiceUuid")
         advertiseDataBuilder.addServiceUuid(ParcelUuid(UUID.fromString(mainServiceUuid)))
 
         /*
-         * Ưu tiên để Service UUID ở advertising data chính để app gốc có filter theo Service UUID
-         * được hệ điều hành trả callback.
-         *
-         * Device name + manufacturerData đưa sang scan response để giảm nguy cơ quá 31 bytes.
+         * Scan response: chứa device name + manufacturer data nếu đủ dung lượng.
          */
         val scanResponseBuilder =
                 AdvertiseData.Builder()
@@ -408,8 +601,14 @@ class BleEmulatorManager(private val context: Context) {
                         .setIncludeTxPowerLevel(false)
 
         profile.manufacturerData.forEach { (id, bytes) ->
-            Log.d(TAG, "Add manufacturerData id=$id, hex=${BlePayloadUtils.bytesToHex(bytes)}")
             scanResponseBuilder.addManufacturerData(id, bytes)
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.START_ADVERTISE,
+                    payload = bytes,
+                    message =
+                            "[FAKE ADVERTISER] Add manufacturerData. id=$id, len=${bytes.size}, utf8=${BlePayloadUtils.tryUtf8Preview(bytes)}"
+            )
         }
 
         val advertiseData: AdvertiseData
@@ -419,38 +618,83 @@ class BleEmulatorManager(private val context: Context) {
             advertiseData = advertiseDataBuilder.build()
             scanResponse = scanResponseBuilder.build()
         } catch (e: IllegalArgumentException) {
-            Log.e(TAG, "Build AdvertiseData lỗi. Có thể dữ liệu advertise/scanResponse quá lớn.", e)
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.ERROR,
+                    message =
+                            "[FAKE ADVERTISER] Build AdvertiseData lỗi. Có thể advertising/scanResponse quá lớn. error=${e.message}"
+            )
             return
         }
 
         _emulatorState.value = EmulatorState.STARTING_ADVERTISER
 
+        emitLog(
+                source = LogSource.ADVERTISER,
+                operation = LogOperation.START_ADVERTISE,
+                message =
+                        "[FAKE ADVERTISER] Calling startAdvertising. mainServiceUuid=$mainServiceUuid, includeName=${!profile.deviceName.isNullOrBlank()}, manufacturerDataCount=${profile.manufacturerData.size}"
+        )
+
         try {
             advertiser?.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
         } catch (e: SecurityException) {
-            Log.e(TAG, "Start advertising lỗi do thiếu quyền BLUETOOTH_ADVERTISE/CONNECT", e)
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.ERROR,
+                    message =
+                            "[FAKE ADVERTISER] Start advertising lỗi do thiếu quyền. error=${e.message}"
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Start advertising lỗi", e)
             _emulatorState.value = EmulatorState.ERROR
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.ERROR,
+                    message = "[FAKE ADVERTISER] Start advertising lỗi. error=${e.message}"
+            )
         }
     }
 
     @SuppressLint("MissingPermission")
     fun stop() {
+        emitLog(
+                source = LogSource.SYSTEM,
+                operation = LogOperation.STOP_ADVERTISE,
+                message = "[EMULATOR] Stop requested"
+        )
+
         try {
             advertiser?.stopAdvertising(advertiseCallback)
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.STOP_ADVERTISE,
+                    message = "[FAKE ADVERTISER] stopAdvertising called"
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Stop advertising lỗi", e)
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.ERROR,
+                    message = "[FAKE ADVERTISER] Stop advertising lỗi. error=${e.message}"
+            )
         }
 
         advertiser = null
 
         try {
             gattServer?.close()
+            emitLog(
+                    source = LogSource.FAKE_GATT_SERVER,
+                    operation = LogOperation.DISCONNECT,
+                    message = "[FAKE GATT] GATT server closed"
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Close GATT server lỗi", e)
+            emitLog(
+                    source = LogSource.FAKE_GATT_SERVER,
+                    operation = LogOperation.ERROR,
+                    message = "[FAKE GATT] Close GATT server lỗi. error=${e.message}"
+            )
         }
 
         gattServer = null
@@ -460,18 +704,28 @@ class BleEmulatorManager(private val context: Context) {
         clientDescriptorValues.clear()
 
         _emulatorState.value = EmulatorState.IDLE
-        Log.d(TAG, "Emulator stopped")
     }
 
     @SuppressLint("MissingPermission")
     private fun createGattDatabase(profile: CapturedBleProfile) {
-        profile.services.forEach { capturedService ->
+        profile.services.forEachIndexed { serviceIndex, capturedService ->
             val serviceUuid = UUID.fromString(capturedService.uuid)
 
             val service =
-                    BluetoothGattService(serviceUuid, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+                    BluetoothGattService(
+                            serviceUuid,
+                            capturedService.type ?: BluetoothGattService.SERVICE_TYPE_PRIMARY
+                    )
 
-            capturedService.characteristics.forEach { capturedChar ->
+            emitLog(
+                    source = LogSource.FAKE_GATT_SERVER,
+                    operation = LogOperation.DISCOVER_SERVICE,
+                    serviceUuid = capturedService.uuid,
+                    message =
+                            "[FAKE GATT] Create service[$serviceIndex]. uuid=${capturedService.uuid}, type=${capturedService.type}, characteristics=${capturedService.characteristics.size}"
+            )
+
+            capturedService.characteristics.forEachIndexed { charIndex, capturedChar ->
                 val characteristicUuid = UUID.fromString(capturedChar.uuid)
 
                 val characteristic =
@@ -484,7 +738,17 @@ class BleEmulatorManager(private val context: Context) {
                 val charKey = characteristicKey(capturedService.uuid, capturedChar.uuid)
                 characteristicValues[charKey] = capturedChar.value
 
-                capturedChar.descriptors.forEach { capturedDesc ->
+                emitLog(
+                        source = LogSource.FAKE_GATT_SERVER,
+                        operation = LogOperation.DISCOVER_SERVICE,
+                        serviceUuid = capturedService.uuid,
+                        characteristicUuid = capturedChar.uuid,
+                        payload = capturedChar.value,
+                        message =
+                                "[FAKE GATT] Create characteristic[$serviceIndex.$charIndex]. key=$charKey, properties=${capturedChar.properties}, mappedProperties=${mapProperties(capturedChar)}, mappedPermissions=${mapPermissions(capturedChar)}, canRead=${capturedChar.canRead}, canWrite=${capturedChar.canWrite}, canWriteNoResponse=${capturedChar.canWriteNoResponse}, canNotify=${capturedChar.canNotify}, canIndicate=${capturedChar.canIndicate}, cachedLen=${capturedChar.value?.size ?: 0}, utf8=${BlePayloadUtils.tryUtf8Preview(capturedChar.value)}"
+                )
+
+                capturedChar.descriptors.forEachIndexed { descIndex, capturedDesc ->
                     val descriptorUuid = UUID.fromString(capturedDesc.uuid)
 
                     val descriptor =
@@ -503,6 +767,17 @@ class BleEmulatorManager(private val context: Context) {
 
                     descriptorValues[descKey] = capturedDesc.value
                     characteristic.addDescriptor(descriptor)
+
+                    emitLog(
+                            source = LogSource.FAKE_GATT_SERVER,
+                            operation = LogOperation.DISCOVER_SERVICE,
+                            serviceUuid = capturedService.uuid,
+                            characteristicUuid = capturedChar.uuid,
+                            descriptorUuid = capturedDesc.uuid,
+                            payload = capturedDesc.value,
+                            message =
+                                    "[FAKE GATT] Create descriptor[$serviceIndex.$charIndex.$descIndex]. key=$descKey, cachedLen=${capturedDesc.value?.size ?: 0}, utf8=${BlePayloadUtils.tryUtf8Preview(capturedDesc.value)}"
+                    )
                 }
 
                 ensureCccdIfNeeded(
@@ -512,14 +787,27 @@ class BleEmulatorManager(private val context: Context) {
                 )
 
                 val added = service.addCharacteristic(characteristic)
-                Log.d(
-                        TAG,
-                        "Add characteristic service=${capturedService.uuid}, char=${capturedChar.uuid}, added=$added"
+
+                emitLog(
+                        source = LogSource.FAKE_GATT_SERVER,
+                        operation = LogOperation.DISCOVER_SERVICE,
+                        serviceUuid = capturedService.uuid,
+                        characteristicUuid = capturedChar.uuid,
+                        message =
+                                "[FAKE GATT] Add characteristic to service. service=${capturedService.uuid}, char=${capturedChar.uuid}, added=$added"
                 )
             }
 
             val ok = gattServer?.addService(service)
-            Log.d(TAG, "Add GATT service ${capturedService.uuid}, ok=$ok")
+
+            emitLog(
+                    source = LogSource.FAKE_GATT_SERVER,
+                    operation = LogOperation.DISCOVER_SERVICE,
+                    serviceUuid = capturedService.uuid,
+                    statusCode = if (ok == true) BluetoothGatt.GATT_SUCCESS else null,
+                    message =
+                            "[FAKE GATT] Add service to GATT server. uuid=${capturedService.uuid}, ok=$ok"
+            )
         }
 
         _emulatorState.value = EmulatorState.GATT_SERVER_RUNNING
@@ -551,7 +839,16 @@ class BleEmulatorManager(private val context: Context) {
         descriptorValues[descKey] = byteArrayOf(0x00, 0x00)
         characteristic.addDescriptor(cccd)
 
-        Log.d(TAG, "Auto add CCCD for service=$serviceUuid, char=${capturedChar.uuid}")
+        emitLog(
+                source = LogSource.FAKE_GATT_SERVER,
+                operation = LogOperation.DISCOVER_SERVICE,
+                serviceUuid = serviceUuid,
+                characteristicUuid = capturedChar.uuid,
+                descriptorUuid = UUID_CCCD.toString(),
+                payload = byteArrayOf(0x00, 0x00),
+                message =
+                        "[FAKE GATT] Auto add CCCD because characteristic supports notify/indicate"
+        )
     }
 
     private fun mapProperties(char: CapturedGattCharacteristic): Int {
@@ -591,10 +888,6 @@ class BleEmulatorManager(private val context: Context) {
             perms = perms or BluetoothGattCharacteristic.PERMISSION_WRITE
         }
 
-        /*
-         * Nếu characteristic không có permission nào, một số app client vẫn có thể cần read.
-         * Gán READ mặc định để tránh characteristic bị quá "câm" ở GATT server giả lập.
-         */
         if (perms == 0) {
             perms = BluetoothGattCharacteristic.PERMISSION_READ
         }
@@ -609,10 +902,19 @@ class BleEmulatorManager(private val context: Context) {
 
         try {
             bluetoothAdapter?.name = name
-            val currentName = bluetoothAdapter?.name
-            Log.d(TAG, "Set local Bluetooth name request=$name, current=$currentName")
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.START_ADVERTISE,
+                    message =
+                            "[FAKE ADVERTISER] Set local Bluetooth name requested. requested=$name, current=${bluetoothAdapter?.name}"
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Không set được Bluetooth name", e)
+            emitLog(
+                    source = LogSource.ADVERTISER,
+                    operation = LogOperation.ERROR,
+                    message =
+                            "[FAKE ADVERTISER] Không set được Bluetooth name. requested=$name, error=${e.message}"
+            )
         }
     }
 
@@ -649,7 +951,7 @@ class BleEmulatorManager(private val context: Context) {
             device: BluetoothDevice,
             descriptor: BluetoothGattDescriptor
     ): String {
-        return "${device.address}|${descriptorKey(descriptor)}"
+        return "${safeAddress(device)}|${descriptorKey(descriptor)}"
     }
 
     private fun defaultDescriptorValue(descriptor: BluetoothGattDescriptor): ByteArray {
@@ -687,9 +989,76 @@ class BleEmulatorManager(private val context: Context) {
         }
     }
 
+    private fun emitLog(
+            source: LogSource,
+            operation: LogOperation,
+            serviceUuid: String? = null,
+            characteristicUuid: String? = null,
+            descriptorUuid: String? = null,
+            payload: ByteArray? = null,
+            statusCode: Int? = null,
+            message: String
+    ) {
+        val payloadHex = payload?.let { BlePayloadUtils.bytesToHex(it) }
+        val entry =
+                BleLogEntry(
+                        source = source,
+                        operation = operation,
+                        serviceUuid = serviceUuid,
+                        characteristicUuid = characteristicUuid,
+                        descriptorUuid = descriptorUuid,
+                        payloadHex = payloadHex,
+                        statusCode = statusCode,
+                        message = message
+                )
+
+        val time = LOG_TIME_FORMAT.format(Date(entry.timestamp))
+
+        val logMessage = buildString {
+            append("[$time] ")
+            append("[${entry.source}] ")
+            append("[${entry.operation}] ")
+            append(message)
+
+            if (!serviceUuid.isNullOrBlank()) {
+                append(" | service=$serviceUuid")
+            }
+
+            if (!characteristicUuid.isNullOrBlank()) {
+                append(" | char=$characteristicUuid")
+            }
+
+            if (!descriptorUuid.isNullOrBlank()) {
+                append(" | desc=$descriptorUuid")
+            }
+
+            if (statusCode != null) {
+                append(" | status=$statusCode")
+            }
+
+            if (!payloadHex.isNullOrBlank()) {
+                append(" | payloadHex=$payloadHex")
+            }
+        }
+
+        Log.d(TAG, logMessage)
+        onLog(entry)
+    }
+
+    private fun safeAddress(device: BluetoothDevice): String {
+        return try {
+            device.address ?: "unknown"
+        } catch (e: Exception) {
+            "unknown"
+        }
+    }
+
     companion object {
         private const val TAG = "BleEmulatorManager"
 
         private val UUID_CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        private val LOG_TIME_FORMAT =
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
     }
 }

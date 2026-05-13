@@ -22,43 +22,86 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/**
- * Panel hiển thị log real-time.
- */
+/** Panel hiển thị log real-time. */
 @Composable
 fun LogPanel(viewModel: MainViewModel) {
     val logs by viewModel.logs.collectAsState()
 
     Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
         Row(modifier = Modifier.fillMaxWidth()) {
-            Text(text = "Logs hệ thống", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-            Button(onClick = { viewModel.clearLogs() }) {
-                Text("Xóa Log")
-            }
+            Text(
+                    text = "Logs hệ thống (${logs.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f)
+            )
+
+            Button(
+                    onClick = { viewModel.exportSystemLogs() },
+                    modifier = Modifier.padding(end = 4.dp)
+            ) { Text("Export") }
+
+            Button(onClick = { viewModel.clearLogs() }) { Text("Xóa") }
         }
 
-        LazyColumn(modifier = Modifier.weight(1f)) {
-            items(logs) { log ->
-                LogItemRow(log = log)
-            }
-        }
+        LazyColumn(modifier = Modifier.weight(1f)) { items(logs) { log -> LogItemRow(log = log) } }
     }
 }
 
 @Composable
 fun LogItemRow(log: BleLogEntry) {
     val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
-    
+
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         Column(modifier = Modifier.padding(8.dp)) {
             Row {
-                Text(text = "[${dateFormat.format(Date(log.timestamp))}]", style = MaterialTheme.typography.bodySmall)
-                Text(text = " [${log.source}]", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                Text(text = " [${log.operation}]", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                Text(
+                        text = "[${dateFormat.format(Date(log.timestamp))}]",
+                        style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                        text = " [${log.source}]",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                        text = " [${log.operation}]",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary
+                )
             }
+
             Text(text = log.message, style = MaterialTheme.typography.bodySmall)
+
+            if (log.serviceUuid != null) {
+                Text(
+                        text = "Service: ${log.serviceUuid}",
+                        style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            if (log.characteristicUuid != null) {
+                Text(
+                        text = "Char: ${log.characteristicUuid}",
+                        style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            if (log.descriptorUuid != null) {
+                Text(
+                        text = "Desc: ${log.descriptorUuid}",
+                        style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            if (log.statusCode != null) {
+                Text(text = "Status: ${log.statusCode}", style = MaterialTheme.typography.bodySmall)
+            }
+
             if (log.payloadHex != null) {
-                Text(text = "Payload: 0x${log.payloadHex}", style = MaterialTheme.typography.bodySmall)
+                Text(
+                        text = "Payload HEX: 0x${log.payloadHex}",
+                        style = MaterialTheme.typography.bodySmall
+                )
             }
         }
     }
