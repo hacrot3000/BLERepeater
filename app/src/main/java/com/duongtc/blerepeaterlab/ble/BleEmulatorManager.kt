@@ -29,10 +29,14 @@ import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /** Quản lý việc giả lập BLE Peripheral và GATT Server. */
 class BleEmulatorManager(
         private val context: Context,
+        private val realGattBridge: RealGattBridge? = null,
         private val onLog: (BleLogEntry) -> Unit = {}
 ) {
 
@@ -46,6 +50,9 @@ class BleEmulatorManager(
 
         private val _emulatorState = MutableStateFlow(EmulatorState.IDLE)
         val emulatorState = _emulatorState.asStateFlow()
+
+        private val scope = CoroutineScope(Dispatchers.IO)
+        private val connectedClients = mutableSetOf<BluetoothDevice>()
 
         /**
          * Cache giá trị characteristic.
@@ -104,8 +111,10 @@ class BleEmulatorManager(
                                 )
 
                                 if (newState == BluetoothGatt.STATE_CONNECTED) {
+                                        connectedClients.add(device)
                                         _emulatorState.value = EmulatorState.CLIENT_CONNECTED
                                 } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                                        connectedClients.remove(device)
                                         _emulatorState.value = EmulatorState.GATT_SERVER_RUNNING
                                 }
                         }
@@ -122,64 +131,111 @@ class BleEmulatorManager(
                                 val serviceUuid = characteristic.service?.uuid?.toString()
                                 val charUuid = characteristic.uuid.toString()
                                 val key = characteristicKey(characteristic)
-                                val fullValue = characteristicValues[key] ?: byteArrayOf()
+                                val cachedValue = characteristicValues[key] ?: byteArrayOf()
 
                                 emitLog(
                                         source = LogSource.FAKE_GATT_SERVER,
                                         operation = LogOperation.READ_CHAR,
                                         serviceUuid = serviceUuid,
                                         characteristicUuid = charUuid,
-                                        payload = fullValue,
-                                        message =
-                                                "[APP->FAKE] Read characteristic request. client=${safeAddress(device)}, requestId=$requestId, offset=$offset, key=$key, cachedLen=${fullValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(fullValue)}"
+                                        payload = cachedValue,
+                                        message = "[APP->FAKE] Read characteristic request. client=${safeAddress(device)}, requestId=$requestId, offset=$offset, key=$key, cachedLen=${cachedValue.size}"
                                 )
 
-                                if (offset > fullValue.size) {
-                                        gattServer?.sendResponse(
-                                                device,
-                                                requestId,
-                                                BluetoothGatt.GATT_INVALID_OFFSET,
-                                                offset,
-                                                null
-                                        )
+                                val isCritical = isCriticalEmptyCharacteristic(serviceUuid, charUuid)
+                                val shouldProxy = realGattBridge != null && (cachedValue.isEmpty() || isCritical)
 
+                                if (shouldProxy && serviceUuid != null) {
                                         emitLog(
                                                 source = LogSource.FAKE_GATT_SERVER,
                                                 operation = LogOperation.READ_CHAR,
                                                 serviceUuid = serviceUuid,
                                                 characteristicUuid = charUuid,
-                                                statusCode = BluetoothGatt.GATT_INVALID_OFFSET,
-                                                message =
-                                                        "[FAKE->APP] Read characteristic response INVALID_OFFSET. client=${safeAddress(device)}, requestId=$requestId, offset=$offset"
+                                                message = "[FAKE->REAL] Forcing realtime read for ${if (isCritical) "critical " else ""}characteristic..."
                                         )
-                                        return
-                                }
+                                        scope.launch {
+                                                val realValue = realGattBridge?.readCharacteristicRealtime(serviceUuid, charUuid)
+                                                val finalValue = if (realValue != null) {
+                                                        characteristicValues[key] = realValue
+                                                        emitLog(
+                                                                source = LogSource.REAL_GATT_CLIENT,
+                                                                operation = LogOperation.READ_CHAR,
+                                                                serviceUuid = serviceUuid,
+                                                                characteristicUuid = charUuid,
+                                                                payload = realValue,
+                                                                message = "[REAL->FAKE] Read characteristic realtime result len=${realValue.size}"
+                                                        )
+                                                        realValue
+                                                } else {
+                                                        emitLog(
+                                                                source = LogSource.REAL_GATT_CLIENT,
+                                                                operation = LogOperation.READ_CHAR,
+                                                                serviceUuid = serviceUuid,
+                                                                characteristicUuid = charUuid,
+                                                                message = "[REAL->FAKE] Read characteristic realtime failed, fallback to cache"
+                                                        )
+                                                        cachedValue
+                                                }
 
-                                val slicedValue =
-                                        if (offset == fullValue.size) {
-                                                byteArrayOf()
-                                        } else {
-                                                fullValue.sliceArray(offset until fullValue.size)
+                                                if (offset > finalValue.size) {
+                                                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+                                                        emitLog(
+                                                                source = LogSource.FAKE_GATT_SERVER,
+                                                                operation = LogOperation.READ_CHAR,
+                                                                serviceUuid = serviceUuid,
+                                                                characteristicUuid = charUuid,
+                                                                statusCode = BluetoothGatt.GATT_INVALID_OFFSET,
+                                                                message = "[FAKE->APP] Read characteristic response INVALID_OFFSET"
+                                                        )
+                                                } else {
+                                                        val slicedValue = if (offset == finalValue.size) {
+                                                                byteArrayOf()
+                                                        } else {
+                                                                finalValue.sliceArray(offset until finalValue.size)
+                                                        }
+
+                                                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slicedValue)
+                                                        emitLog(
+                                                                source = LogSource.FAKE_GATT_SERVER,
+                                                                operation = LogOperation.READ_CHAR,
+                                                                serviceUuid = serviceUuid,
+                                                                characteristicUuid = charUuid,
+                                                                payload = slicedValue,
+                                                                statusCode = BluetoothGatt.GATT_SUCCESS,
+                                                                message = "[FAKE->APP] Read characteristic response SUCCESS. responseLen=${slicedValue.size}"
+                                                        )
+                                                }
                                         }
+                                } else {
+                                        if (offset > cachedValue.size) {
+                                                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+                                                emitLog(
+                                                        source = LogSource.FAKE_GATT_SERVER,
+                                                        operation = LogOperation.READ_CHAR,
+                                                        serviceUuid = serviceUuid,
+                                                        characteristicUuid = charUuid,
+                                                        statusCode = BluetoothGatt.GATT_INVALID_OFFSET,
+                                                        message = "[FAKE->APP] Read characteristic response INVALID_OFFSET"
+                                                )
+                                        } else {
+                                                val slicedValue = if (offset == cachedValue.size) {
+                                                        byteArrayOf()
+                                                } else {
+                                                        cachedValue.sliceArray(offset until cachedValue.size)
+                                                }
 
-                                gattServer?.sendResponse(
-                                        device,
-                                        requestId,
-                                        BluetoothGatt.GATT_SUCCESS,
-                                        offset,
-                                        slicedValue
-                                )
-                                
-                                emitLog(
-                                        source = LogSource.FAKE_GATT_SERVER,
-                                        operation = LogOperation.READ_CHAR,
-                                        serviceUuid = serviceUuid,
-                                        characteristicUuid = charUuid,
-                                        payload = slicedValue,
-                                        statusCode = BluetoothGatt.GATT_SUCCESS,
-                                        message =
-                                                "[FAKE->APP] Read characteristic response SUCCESS. client=${safeAddress(device)}, requestId=$requestId, offset=$offset, responseLen=${slicedValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(slicedValue)}"
-                                )
+                                                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slicedValue)
+                                                emitLog(
+                                                        source = LogSource.FAKE_GATT_SERVER,
+                                                        operation = LogOperation.READ_CHAR,
+                                                        serviceUuid = serviceUuid,
+                                                        characteristicUuid = charUuid,
+                                                        payload = slicedValue,
+                                                        statusCode = BluetoothGatt.GATT_SUCCESS,
+                                                        message = "[FAKE->APP] Read characteristic response SUCCESS. responseLen=${slicedValue.size}"
+                                                )
+                                        }
+                                }
                         }
 
                         @SuppressLint("MissingPermission")
@@ -192,15 +248,7 @@ class BleEmulatorManager(
                                 offset: Int,
                                 value: ByteArray
                         ) {
-                                super.onCharacteristicWriteRequest(
-                                        device,
-                                        requestId,
-                                        characteristic,
-                                        preparedWrite,
-                                        responseNeeded,
-                                        offset,
-                                        value
-                                )
+                                super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
 
                                 val serviceUuid = characteristic.service?.uuid?.toString()
                                 val charUuid = characteristic.uuid.toString()
@@ -212,18 +260,11 @@ class BleEmulatorManager(
                                         serviceUuid = serviceUuid,
                                         characteristicUuid = charUuid,
                                         payload = value,
-                                        message =
-                                                "[APP->FAKE] Write characteristic request. client=${safeAddress(device)}, requestId=$requestId, preparedWrite=$preparedWrite, responseNeeded=$responseNeeded, offset=$offset, key=$key, len=${value.size}, utf8=${BlePayloadUtils.tryUtf8Preview(value)}"
+                                        message = "[APP->FAKE] Write characteristic request. client=${safeAddress(device)}, len=${value.size}"
                                 )
 
                                 val oldValue = characteristicValues[key] ?: byteArrayOf()
-                                val newValue =
-                                        if (offset <= 0) {
-                                                value
-                                        } else {
-                                                mergeWriteValue(oldValue, offset, value)
-                                        }
-
+                                val newValue = if (offset <= 0) value else mergeWriteValue(oldValue, offset, value)
                                 characteristicValues[key] = newValue
 
                                 emitLog(
@@ -232,44 +273,57 @@ class BleEmulatorManager(
                                         serviceUuid = serviceUuid,
                                         characteristicUuid = charUuid,
                                         payload = newValue,
-                                        message =
-                                                "[FAKE CACHE] Characteristic cache updated. key=$key, oldLen=${oldValue.size}, newLen=${newValue.size}"
+                                        message = "[FAKE CACHE] Characteristic cache updated. key=$key, oldLen=${oldValue.size}, newLen=${newValue.size}"
                                 )
 
-                                /*
-                                 * Hiện tại chưa có proxy realtime sang thiết bị thật.
-                                 * Log rõ ràng để sau này khi bổ sung bridge có thể so sánh:
-                                 * APP->FAKE, FAKE->REAL, REAL->FAKE, FAKE->APP.
-                                 */
-                                emitLog(
-                                        source = LogSource.REAL_GATT_CLIENT,
-                                        operation = LogOperation.WRITE_CHAR,
-                                        serviceUuid = serviceUuid,
-                                        characteristicUuid = charUuid,
-                                        payload = value,
-                                        message =
-                                                "[FAKE->REAL] NOT_IMPLEMENTED. Payload app gửi chưa được forward sang thiết bị thật."
-                                )
+                                val writeType = if ((characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 && !responseNeeded) {
+                                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                                } else {
+                                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                                }
 
-                                if (responseNeeded) {
-                                        gattServer?.sendResponse(
-                                                device,
-                                                requestId,
-                                                BluetoothGatt.GATT_SUCCESS,
-                                                offset,
-                                                value
-                                        )
-
+                                if (realGattBridge != null && serviceUuid != null) {
                                         emitLog(
                                                 source = LogSource.FAKE_GATT_SERVER,
                                                 operation = LogOperation.WRITE_CHAR,
                                                 serviceUuid = serviceUuid,
                                                 characteristicUuid = charUuid,
-                                                payload = value,
-                                                statusCode = BluetoothGatt.GATT_SUCCESS,
-                                                message =
-                                                        "[FAKE->APP] Write characteristic response SUCCESS. client=${safeAddress(device)}, requestId=$requestId"
+                                                message = "[FAKE->REAL] Forwarding write to real device..."
                                         )
+                                        scope.launch {
+                                                val success = realGattBridge.writeCharacteristicRealtime(serviceUuid, charUuid, value, writeType)
+                                                emitLog(
+                                                        source = LogSource.REAL_GATT_CLIENT,
+                                                        operation = LogOperation.WRITE_CHAR,
+                                                        serviceUuid = serviceUuid,
+                                                        characteristicUuid = charUuid,
+                                                        message = "[REAL->FAKE] Write characteristic result=$success"
+                                                )
+                                                if (responseNeeded) {
+                                                        val status = if (success) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
+                                                        gattServer?.sendResponse(device, requestId, status, offset, value)
+                                                        emitLog(
+                                                                source = LogSource.FAKE_GATT_SERVER,
+                                                                operation = LogOperation.WRITE_CHAR,
+                                                                serviceUuid = serviceUuid,
+                                                                characteristicUuid = charUuid,
+                                                                statusCode = status,
+                                                                message = "[FAKE->APP] Write response sent with status=$status"
+                                                        )
+                                                }
+                                        }
+                                } else {
+                                        if (responseNeeded) {
+                                                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                                                emitLog(
+                                                        source = LogSource.FAKE_GATT_SERVER,
+                                                        operation = LogOperation.WRITE_CHAR,
+                                                        serviceUuid = serviceUuid,
+                                                        characteristicUuid = charUuid,
+                                                        statusCode = BluetoothGatt.GATT_SUCCESS,
+                                                        message = "[FAKE->APP] Write response SUCCESS (cached only)"
+                                                )
+                                        }
                                 }
                         }
 
@@ -387,21 +441,11 @@ class BleEmulatorManager(
                                         characteristicUuid = charUuid,
                                         descriptorUuid = descUuid,
                                         payload = value,
-                                        message =
-                                                "[APP->FAKE] Write descriptor request. client=${safeAddress(device)}, requestId=$requestId, preparedWrite=$preparedWrite, responseNeeded=$responseNeeded, offset=$offset, key=$baseKey, clientKey=$clientKey, len=${value.size}, utf8=${BlePayloadUtils.tryUtf8Preview(value)}"
+                                        message = "[APP->FAKE] Write descriptor request. client=${safeAddress(device)}, key=$baseKey"
                                 )
 
-                                val oldValue =
-                                        clientDescriptorValues[clientKey]
-                                                ?: descriptorValues[baseKey] ?: byteArrayOf()
-
-                                val newValue =
-                                        if (offset <= 0) {
-                                                value
-                                        } else {
-                                                mergeWriteValue(oldValue, offset, value)
-                                        }
-
+                                val oldValue = clientDescriptorValues[clientKey] ?: descriptorValues[baseKey] ?: byteArrayOf()
+                                val newValue = if (offset <= 0) value else mergeWriteValue(oldValue, offset, value)
                                 clientDescriptorValues[clientKey] = newValue
 
                                 if (descriptor.uuid == UUID_CCCD) {
@@ -412,9 +456,31 @@ class BleEmulatorManager(
                                                 characteristicUuid = charUuid,
                                                 descriptorUuid = descUuid,
                                                 payload = newValue,
-                                                message =
-                                                        "[APP->FAKE] CCCD updated. client=${safeAddress(device)}, state=${describeCccdValue(newValue)}"
+                                                message = "[APP->FAKE] CCCD updated. client=${safeAddress(device)}, state=${describeCccdValue(newValue)}"
                                         )
+                                        
+                                        if (realGattBridge != null && serviceUuid != null && charUuid != null) {
+                                                val enable = newValue.isNotEmpty() && (newValue[0] == 0x01.toByte() || newValue[0] == 0x02.toByte())
+                                                val indication = newValue.isNotEmpty() && newValue[0] == 0x02.toByte()
+                                                
+                                                emitLog(
+                                                        source = LogSource.FAKE_GATT_SERVER,
+                                                        operation = LogOperation.WRITE_DESC,
+                                                        serviceUuid = serviceUuid,
+                                                        characteristicUuid = charUuid,
+                                                        message = "[FAKE->REAL] Setting notification realtime: enable=$enable, indication=$indication"
+                                                )
+                                                scope.launch {
+                                                        val success = realGattBridge.setCharacteristicNotificationRealtime(serviceUuid, charUuid, enable, indication)
+                                                        emitLog(
+                                                                source = LogSource.REAL_GATT_CLIENT,
+                                                                operation = LogOperation.WRITE_DESC,
+                                                                serviceUuid = serviceUuid,
+                                                                characteristicUuid = charUuid,
+                                                                message = "[REAL->FAKE] Set notification result=$success"
+                                                        )
+                                                }
+                                        }
                                 } else {
                                         emitLog(
                                                 source = LogSource.SYSTEM,
@@ -423,8 +489,7 @@ class BleEmulatorManager(
                                                 characteristicUuid = charUuid,
                                                 descriptorUuid = descUuid,
                                                 payload = newValue,
-                                                message =
-                                                        "[FAKE CACHE] Descriptor client cache updated. client=${safeAddress(device)}, oldLen=${oldValue.size}, newLen=${newValue.size}"
+                                                message = "[FAKE CACHE] Descriptor client cache updated. client=${safeAddress(device)}"
                                         )
                                 }
 
@@ -445,8 +510,7 @@ class BleEmulatorManager(
                                                 descriptorUuid = descUuid,
                                                 payload = value,
                                                 statusCode = BluetoothGatt.GATT_SUCCESS,
-                                                message =
-                                                        "[FAKE->APP] Write descriptor response SUCCESS. client=${safeAddress(device)}, requestId=$requestId"
+                                                message = "[FAKE->APP] Write descriptor response SUCCESS. client=${safeAddress(device)}"
                                         )
                                 }
                         }
@@ -499,6 +563,45 @@ class BleEmulatorManager(
         @SuppressLint("MissingPermission")
         fun start(profile: CapturedBleProfile) {
                 stop()
+
+                realGattBridge?.setOnRealtimeCharacteristicChanged { sUuid, cUuid, value ->
+                        val key = characteristicKey(sUuid, cUuid)
+                        characteristicValues[key] = value
+                        
+                        emitLog(
+                                source = LogSource.REAL_GATT_CLIENT,
+                                operation = LogOperation.NOTIFY,
+                                serviceUuid = sUuid,
+                                characteristicUuid = cUuid,
+                                payload = value,
+                                message = "[REAL->FAKE] Notification received len=${value.size}"
+                        )
+                        
+                        // Notify clients
+                        scope.launch {
+                                val service = gattServer?.getService(UUID.fromString(sUuid))
+                                val char = service?.getCharacteristic(UUID.fromString(cUuid))
+                                if (char != null) {
+                                        connectedClients.forEach { client ->
+                                                val clientKey = "${safeAddress(client)}|$key|${UUID_CCCD}"
+                                                val cccdValue = clientDescriptorValues[clientKey]
+                                                val isSubscribed = cccdValue != null && cccdValue.isNotEmpty() && cccdValue[0] != 0x00.toByte()
+                                                if (isSubscribed) {
+                                                        val confirm = cccdValue!![0] == 0x02.toByte()
+                                                        char.value = value
+                                                        val sent = gattServer?.notifyCharacteristicChanged(client, char, confirm)
+                                                        emitLog(
+                                                                source = LogSource.FAKE_GATT_SERVER,
+                                                                operation = LogOperation.NOTIFY,
+                                                                serviceUuid = sUuid,
+                                                                characteristicUuid = cUuid,
+                                                                message = "[FAKE->APP] notifyCharacteristicChanged sent to ${safeAddress(client)}, confirm=$confirm, success=$sent"
+                                                        )
+                                                }
+                                        }
+                                }
+                        }
+                }
 
                 emitLog(
                         source = LogSource.SYSTEM,
@@ -1052,6 +1155,11 @@ class BleEmulatorManager(
                 } catch (e: Exception) {
                         "unknown"
                 }
+        }
+
+        private fun isCriticalEmptyCharacteristic(serviceUuid: String?, charUuid: String?): Boolean {
+                return serviceUuid?.lowercase() == "d4905f67-8931-4faa-8c61-86ec7490f3c5" &&
+                       charUuid?.lowercase() == "d1da175e-b1b5-4248-8f36-98c9482b8d24"
         }
 
         private fun buildEmulatorDeviceName(originalName: String?): String {

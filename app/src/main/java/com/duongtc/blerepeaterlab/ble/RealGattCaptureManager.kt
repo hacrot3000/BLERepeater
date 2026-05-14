@@ -27,7 +27,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** Quản lý việc kết nối tới thiết bị thật và capture GATT profile. */
-class RealGattCaptureManager(private val context: Context) {
+class RealGattCaptureManager(private val context: Context) : RealGattBridge {
 
     private var selectedScanItem: BleScanItem? = null
     private val bluetoothManager =
@@ -43,7 +43,12 @@ class RealGattCaptureManager(private val context: Context) {
 
     // Mutex để đảm bảo các thao tác GATT chạy tuần tự
     private val mutex = Mutex()
+    private var readDeferred: CompletableDeferred<ByteArray?>? = null
+    private var writeDeferred: CompletableDeferred<Boolean>? = null
+    private var descriptorDeferred: CompletableDeferred<Boolean>? = null
     private var operationDeferred: CompletableDeferred<Any?>? = null
+
+    private var onRealtimeCharacteristicChanged: ((serviceUuid: String, characteristicUuid: String, value: ByteArray) -> Unit)? = null
 
     private val scope = CoroutineScope(Dispatchers.IO)
 
@@ -106,8 +111,10 @@ class RealGattCaptureManager(private val context: Context) {
                     )
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         operationDeferred?.complete(characteristic.value)
+                        readDeferred?.complete(characteristic.value)
                     } else {
                         operationDeferred?.complete(null)
+                        readDeferred?.complete(null)
                     }
                 }
 
@@ -124,8 +131,51 @@ class RealGattCaptureManager(private val context: Context) {
                     )
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         operationDeferred?.complete(descriptor.value)
+                        descriptorDeferred?.complete(true)
                     } else {
                         operationDeferred?.complete(null)
+                        descriptorDeferred?.complete(false)
+                    }
+                }
+
+                @Suppress("DEPRECATION")
+                override fun onCharacteristicWrite(
+                        gatt: BluetoothGatt,
+                        characteristic: BluetoothGattCharacteristic,
+                        status: Int
+                ) {
+                    super.onCharacteristicWrite(gatt, characteristic, status)
+                    Log.d("RealGattCaptureManager", "onCharacteristicWrite: ${characteristic.uuid}, status=$status")
+                    writeDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+                }
+
+                @Suppress("DEPRECATION")
+                override fun onDescriptorWrite(
+                        gatt: BluetoothGatt,
+                        descriptor: BluetoothGattDescriptor,
+                        status: Int
+                ) {
+                    super.onDescriptorWrite(gatt, descriptor, status)
+                    Log.d("RealGattCaptureManager", "onDescriptorWrite: ${descriptor.uuid}, status=$status")
+                    descriptorDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+                }
+
+                @Suppress("DEPRECATION")
+                override fun onCharacteristicChanged(
+                        gatt: BluetoothGatt,
+                        characteristic: BluetoothGattCharacteristic
+                ) {
+                    super.onCharacteristicChanged(gatt, characteristic)
+                    val serviceUuid = characteristic.service?.uuid?.toString() ?: return
+                    val charUuid = characteristic.uuid.toString()
+                    val value = characteristic.value ?: byteArrayOf()
+                    Log.d("RealGattCaptureManager", "onCharacteristicChanged: $charUuid, len=${value.size}")
+                    onRealtimeCharacteristicChanged?.invoke(serviceUuid, charUuid, value)
+                    // Nếu có lưu cache ở manager này thì cập nhật
+                    _capturedProfile.value?.let { profile ->
+                        profile.services.find { it.uuid.equals(serviceUuid, ignoreCase = true) }
+                                ?.characteristics?.find { it.uuid.equals(charUuid, ignoreCase = true) }
+                                ?.value = value
                     }
                 }
             }
@@ -140,6 +190,10 @@ class RealGattCaptureManager(private val context: Context) {
         _captureState.value = CaptureState.CONNECTING
         bluetoothGatt =
                 device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    override fun setOnRealtimeCharacteristicChanged(listener: ((serviceUuid: String, characteristicUuid: String, value: ByteArray) -> Unit)?) {
+        onRealtimeCharacteristicChanged = listener
     }
 
     @SuppressLint("MissingPermission")
@@ -255,6 +309,104 @@ class RealGattCaptureManager(private val context: Context) {
             }
 
     @SuppressLint("MissingPermission")
+    override suspend fun readCharacteristicRealtime(serviceUuid: String, characteristicUuid: String): ByteArray? {
+        val gatt = bluetoothGatt ?: run {
+            Log.e("RealGattCaptureManager", "readCharacteristicRealtime: GATT is null")
+            return null
+        }
+        val service = gatt.getService(java.util.UUID.fromString(serviceUuid)) ?: run {
+            Log.e("RealGattCaptureManager", "readCharacteristicRealtime: Service not found $serviceUuid")
+            return null
+        }
+        val char = service.getCharacteristic(java.util.UUID.fromString(characteristicUuid)) ?: run {
+            Log.e("RealGattCaptureManager", "readCharacteristicRealtime: Characteristic not found $characteristicUuid")
+            return null
+        }
+
+        return mutex.withLock {
+            readDeferred = CompletableDeferred()
+            val success = gatt.readCharacteristic(char)
+            if (!success) return@withLock null
+            val result = withTimeoutOrNull(3000) { readDeferred?.await() }
+            if (result == null || result.isEmpty()) {
+                Log.w("RealGattCaptureManager", "readCharacteristicRealtime: $characteristicUuid returned empty/null")
+            }
+            result
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    override suspend fun writeCharacteristicRealtime(
+            serviceUuid: String,
+            characteristicUuid: String,
+            value: ByteArray,
+            writeType: Int
+    ): Boolean {
+        val gatt = bluetoothGatt ?: run {
+            Log.e("RealGattCaptureManager", "writeCharacteristicRealtime: GATT is null")
+            return false
+        }
+        val service = gatt.getService(java.util.UUID.fromString(serviceUuid)) ?: run {
+            Log.e("RealGattCaptureManager", "writeCharacteristicRealtime: Service not found $serviceUuid")
+            return false
+        }
+        val char = service.getCharacteristic(java.util.UUID.fromString(characteristicUuid)) ?: run {
+            Log.e("RealGattCaptureManager", "writeCharacteristicRealtime: Characteristic not found $characteristicUuid")
+            return false
+        }
+
+        return mutex.withLock {
+            writeDeferred = CompletableDeferred()
+            char.writeType = writeType
+            
+            val success = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(char, value, writeType) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                char.value = value
+                gatt.writeCharacteristic(char)
+            }
+            
+            if (!success) return@withLock false
+            withTimeoutOrNull(3000) { writeDeferred?.await() } ?: false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    override suspend fun setCharacteristicNotificationRealtime(
+            serviceUuid: String,
+            characteristicUuid: String,
+            enable: Boolean,
+            indication: Boolean
+    ): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        val service = gatt.getService(java.util.UUID.fromString(serviceUuid)) ?: return false
+        val char = service.getCharacteristic(java.util.UUID.fromString(characteristicUuid)) ?: return false
+
+        return mutex.withLock {
+            gatt.setCharacteristicNotification(char, enable)
+            val cccdUuid = java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+            val descriptor = char.getDescriptor(cccdUuid) ?: return@withLock false
+
+            descriptorDeferred = CompletableDeferred()
+            val value = if (enable) {
+                if (indication) BluetoothGattDescriptor.ENABLE_INDICATION_VALUE else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            } else {
+                BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+            }
+            
+            val success = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(descriptor, value) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                descriptor.value = value
+                gatt.writeDescriptor(descriptor)
+            }
+            
+            if (!success) return@withLock false
+            withTimeoutOrNull(3000) { descriptorDeferred?.await() } ?: false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private suspend fun readDescriptorSuspending(
             gatt: BluetoothGatt,
             desc: BluetoothGattDescriptor
@@ -291,6 +443,13 @@ class RealGattCaptureManager(private val context: Context) {
         // Hầu hết descriptor đều đọc được, hoặc có thể thử đọc
         return true
     }
+}
+
+interface RealGattBridge {
+    suspend fun readCharacteristicRealtime(serviceUuid: String, characteristicUuid: String): ByteArray?
+    suspend fun writeCharacteristicRealtime(serviceUuid: String, characteristicUuid: String, value: ByteArray, writeType: Int): Boolean
+    suspend fun setCharacteristicNotificationRealtime(serviceUuid: String, characteristicUuid: String, enable: Boolean, indication: Boolean): Boolean
+    fun setOnRealtimeCharacteristicChanged(listener: ((serviceUuid: String, characteristicUuid: String, value: ByteArray) -> Unit)?)
 }
 
 enum class CaptureState {

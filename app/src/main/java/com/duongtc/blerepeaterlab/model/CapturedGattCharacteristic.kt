@@ -7,7 +7,7 @@ data class CapturedGattCharacteristic(
     val uuid: String,
     val properties: Int,
     val permissionsForServer: Int, // Quyền cho GATT Server giả lập
-    val value: ByteArray? = null,
+    var value: ByteArray? = null,
     val descriptors: List<CapturedGattDescriptor> = emptyList(),
     val canRead: Boolean = false,
     val canWrite: Boolean = false,

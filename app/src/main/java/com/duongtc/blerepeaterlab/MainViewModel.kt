@@ -25,8 +25,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         private val scannerManager = BleScannerManager(application)
         private val captureManager = RealGattCaptureManager(application)
-
-        private val emulatorManager = BleEmulatorManager(application) { entry -> addLog(entry) }
+        
+        private val emulatorManager = BleEmulatorManager(application, captureManager) { entry -> addLog(entry) }
 
         val scanResults = scannerManager.scanResults
         val isScanning = scannerManager.isScanning
