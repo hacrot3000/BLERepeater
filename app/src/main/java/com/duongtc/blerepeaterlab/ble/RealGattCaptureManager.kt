@@ -156,8 +156,21 @@ class RealGattCaptureManager(private val context: Context) : RealGattBridge {
                         status: Int
                 ) {
                     super.onDescriptorWrite(gatt, descriptor, status)
-                    Log.d("RealGattCaptureManager", "onDescriptorWrite: ${descriptor.uuid}, status=$status")
+                    val serviceUuid = descriptor.characteristic?.service?.uuid?.toString() ?: ""
+                    val charUuid = descriptor.characteristic?.uuid?.toString() ?: ""
+                    Log.d("RealGattCaptureManager", "[REAL_GATT_CLIENT] [WRITE_DESC] [REAL] Descriptor write completed. status=$status | service=$serviceUuid | char=$charUuid | desc=${descriptor.uuid}")
                     descriptorDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+                }
+
+                override fun onCharacteristicChanged(
+                        gatt: BluetoothGatt,
+                        characteristic: BluetoothGattCharacteristic,
+                        value: ByteArray
+                ) {
+                    super.onCharacteristicChanged(gatt, characteristic, value)
+                    val serviceUuid = characteristic.service?.uuid?.toString() ?: return
+                    val charUuid = characteristic.uuid.toString()
+                    handleCharacteristicChanged(serviceUuid, charUuid, value)
                 }
 
                 @Suppress("DEPRECATION")
@@ -169,16 +182,24 @@ class RealGattCaptureManager(private val context: Context) : RealGattBridge {
                     val serviceUuid = characteristic.service?.uuid?.toString() ?: return
                     val charUuid = characteristic.uuid.toString()
                     val value = characteristic.value ?: byteArrayOf()
-                    Log.d("RealGattCaptureManager", "onCharacteristicChanged: $charUuid, len=${value.size}")
-                    onRealtimeCharacteristicChanged?.invoke(serviceUuid, charUuid, value)
-                    // Nếu có lưu cache ở manager này thì cập nhật
-                    _capturedProfile.value?.let { profile ->
-                        profile.services.find { it.uuid.equals(serviceUuid, ignoreCase = true) }
-                                ?.characteristics?.find { it.uuid.equals(charUuid, ignoreCase = true) }
-                                ?.value = value
-                    }
+                    handleCharacteristicChanged(serviceUuid, charUuid, value)
                 }
             }
+
+    private fun handleCharacteristicChanged(
+            serviceUuid: String,
+            charUuid: String,
+            value: ByteArray
+    ) {
+        Log.d("RealGattCaptureManager", "onCharacteristicChanged: $charUuid, len=${value.size}")
+        onRealtimeCharacteristicChanged?.invoke(serviceUuid, charUuid, value)
+        // Nếu có lưu cache ở manager này thì cập nhật
+        _capturedProfile.value?.let { profile ->
+            profile.services.find { it.uuid.equals(serviceUuid, ignoreCase = true) }
+                    ?.characteristics?.find { it.uuid.equals(charUuid, ignoreCase = true) }
+                    ?.value = value
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun connect(scanItem: BleScanItem) {
