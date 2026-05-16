@@ -53,6 +53,15 @@ class BleEmulatorManager(
         private val _emulatorState = MutableStateFlow(EmulatorState.IDLE)
         val emulatorState = _emulatorState.asStateFlow()
 
+        private enum class AdvertiseRetryMode {
+                FULL_FRAME_WITH_NAME,
+                FULL_FRAME_NO_NAME,
+                ORIGINAL
+        }
+
+        private var currentRetryMode = AdvertiseRetryMode.FULL_FRAME_WITH_NAME
+        private var currentProfile: CapturedBleProfile? = null
+
         private val scope = CoroutineScope(Dispatchers.IO)
         private val connectedClients = mutableSetOf<BluetoothDevice>()
 
@@ -87,6 +96,39 @@ class BleEmulatorManager(
 
         private val subscribedIndicationMode =
                 ConcurrentHashMap<String, Boolean>()
+
+        private data class PreparedWriteChunk(
+                val serviceUuid: String,
+                val characteristicUuid: String,
+                val characteristicKey: String,
+                val offset: Int,
+                val value: ByteArray
+        )
+
+        private val pendingPreparedCharacteristicWrites =
+                mutableMapOf<String, MutableList<PreparedWriteChunk>>()
+
+        private fun preparedWriteDeviceKey(device: BluetoothDevice): String {
+                return safeAddress(device)
+        }
+
+        private fun buildPreparedWriteValue(chunks: List<PreparedWriteChunk>): ByteArray {
+                if (chunks.isEmpty()) {
+                        return ByteArray(0)
+                }
+
+                val finalSize = chunks.maxOf { it.offset + it.value.size }
+                val result = ByteArray(finalSize)
+
+                chunks.sortedBy { it.offset }.forEach { chunk ->
+                        chunk.value.copyInto(
+                                destination = result,
+                                destinationOffset = chunk.offset
+                        )
+                }
+
+                return result
+        }
 
         private fun gattKey(serviceUuid: UUID, characteristicUuid: UUID): String {
                 return characteristicKey(serviceUuid.toString(), characteristicUuid.toString())
@@ -129,6 +171,7 @@ class BleEmulatorManager(
                                         _emulatorState.value = EmulatorState.CLIENT_CONNECTED
                                 } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                                         connectedClients.remove(device)
+                                        pendingPreparedCharacteristicWrites.remove(preparedWriteDeviceKey(device))
                                         _emulatorState.value = EmulatorState.GATT_SERVER_RUNNING
                                 }
                         }
@@ -278,16 +321,51 @@ class BleEmulatorManager(
                                 )
 
                                 if (preparedWrite) {
+                                        val deviceKey = preparedWriteDeviceKey(device)
+
+                                        val list = pendingPreparedCharacteristicWrites.getOrPut(deviceKey) {
+                                                mutableListOf()
+                                        }
+
+                                        list.add(
+                                                PreparedWriteChunk(
+                                                        serviceUuid = serviceUuid.orEmpty(),
+                                                        characteristicUuid = charUuid,
+                                                        characteristicKey = key,
+                                                        offset = offset,
+                                                        value = value.copyOf()
+                                                )
+                                        )
+
                                         emitLog(
                                                 source = LogSource.FAKE_GATT_SERVER,
                                                 operation = LogOperation.WRITE_CHAR,
                                                 serviceUuid = serviceUuid,
                                                 characteristicUuid = charUuid,
-                                                message = "[APP->FAKE] WARNING: Prepared write not fully supported yet. Merging to cache."
+                                                payload = value,
+                                                message = "[APP->FAKE] Buffered prepared write chunk. client=${safeAddress(device)}, offset=$offset, len=${value.size}, chunks=${list.size}"
                                         )
-                                        val oldValue = characteristicValues[key] ?: byteArrayOf()
-                                        val newValue = if (offset <= 0) value else mergeWriteValue(oldValue, offset, value)
-                                        characteristicValues[key] = newValue
+
+                                        if (responseNeeded) {
+                                                gattServer?.sendResponse(
+                                                        device,
+                                                        requestId,
+                                                        BluetoothGatt.GATT_SUCCESS,
+                                                        offset,
+                                                        value
+                                                )
+
+                                                emitLog(
+                                                        source = LogSource.FAKE_GATT_SERVER,
+                                                        operation = LogOperation.WRITE_CHAR,
+                                                        serviceUuid = serviceUuid,
+                                                        characteristicUuid = charUuid,
+                                                        statusCode = BluetoothGatt.GATT_SUCCESS,
+                                                        message = "[FAKE->APP] Prepared write ACK sent. offset=$offset, len=${value.size}"
+                                                )
+                                        }
+
+                                        return
                                 } else {
                                         characteristicValues[key] = value.copyOf()
 
@@ -592,6 +670,131 @@ class BleEmulatorManager(
                                         message = "[FAKE->APP] onNotificationSent. client=${safeAddress(device)}, status=$status"
                                 )
                         }
+
+                        @SuppressLint("MissingPermission")
+                        override fun onExecuteWrite(
+                                device: BluetoothDevice,
+                                requestId: Int,
+                                execute: Boolean
+                        ) {
+                                super.onExecuteWrite(device, requestId, execute)
+
+                                val deviceKey = preparedWriteDeviceKey(device)
+                                val chunks = pendingPreparedCharacteristicWrites.remove(deviceKey).orEmpty()
+
+                                emitLog(
+                                        source = LogSource.FAKE_GATT_SERVER,
+                                        operation = LogOperation.WRITE_CHAR,
+                                        message = "[APP->FAKE] Execute prepared write. client=${safeAddress(device)}, execute=$execute, chunks=${chunks.size}"
+                                )
+
+                                if (!execute) {
+                                        gattServer?.sendResponse(
+                                                device,
+                                                requestId,
+                                                BluetoothGatt.GATT_SUCCESS,
+                                                0,
+                                                null
+                                        )
+
+                                        emitLog(
+                                                source = LogSource.FAKE_GATT_SERVER,
+                                                operation = LogOperation.WRITE_CHAR,
+                                                statusCode = BluetoothGatt.GATT_SUCCESS,
+                                                message = "[FAKE->APP] Execute write cancelled. Buffered chunks dropped."
+                                        )
+
+                                        return
+                                }
+
+                                if (chunks.isEmpty()) {
+                                        gattServer?.sendResponse(
+                                                device,
+                                                requestId,
+                                                BluetoothGatt.GATT_SUCCESS,
+                                                0,
+                                                null
+                                        )
+
+                                        emitLog(
+                                                source = LogSource.FAKE_GATT_SERVER,
+                                                operation = LogOperation.WRITE_CHAR,
+                                                statusCode = BluetoothGatt.GATT_SUCCESS,
+                                                message = "[FAKE->APP] Execute write had no chunks. Response success."
+                                        )
+
+                                        return
+                                }
+
+                                scope.launch {
+                                        var allSuccess = true
+
+                                        chunks.groupBy { it.characteristicKey }.forEach { (_, groupedChunks) ->
+                                                val first = groupedChunks.first()
+                                                val finalValue = buildPreparedWriteValue(groupedChunks)
+
+                                                characteristicValues[first.characteristicKey] = finalValue
+
+                                                emitLog(
+                                                        source = LogSource.FAKE_GATT_SERVER,
+                                                        operation = LogOperation.WRITE_CHAR,
+                                                        serviceUuid = first.serviceUuid,
+                                                        characteristicUuid = first.characteristicUuid,
+                                                        payload = finalValue,
+                                                        message = "[APP->FAKE] Prepared write assembled. finalLen=${finalValue.size}, utf8=${BlePayloadUtils.tryUtf8Preview(finalValue)}"
+                                                )
+
+                                                if (realGattBridge != null && first.serviceUuid.isNotBlank()) {
+                                                        emitLog(
+                                                                source = LogSource.FAKE_GATT_SERVER,
+                                                                operation = LogOperation.WRITE_CHAR,
+                                                                serviceUuid = first.serviceUuid,
+                                                                characteristicUuid = first.characteristicUuid,
+                                                                payload = finalValue,
+                                                                message = "[FAKE->REAL] Forwarding assembled prepared write to real device..."
+                                                        )
+
+                                                        val success = realGattBridge.writeCharacteristicRealtime(
+                                                                first.serviceUuid,
+                                                                first.characteristicUuid,
+                                                                finalValue,
+                                                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                                                        )
+
+                                                        emitLog(
+                                                                source = LogSource.REAL_GATT_CLIENT,
+                                                                operation = LogOperation.WRITE_CHAR,
+                                                                serviceUuid = first.serviceUuid,
+                                                                characteristicUuid = first.characteristicUuid,
+                                                                statusCode = if (success) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE,
+                                                                message = "[REAL->FAKE] Assembled prepared write result=$success"
+                                                        )
+
+                                                        if (!success) {
+                                                                allSuccess = false
+                                                        }
+                                                }
+                                        }
+
+                                        val status =
+                                                if (allSuccess) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
+
+                                        gattServer?.sendResponse(
+                                                device,
+                                                requestId,
+                                                status,
+                                                0,
+                                                null
+                                        )
+
+                                        emitLog(
+                                                source = LogSource.FAKE_GATT_SERVER,
+                                                operation = LogOperation.WRITE_CHAR,
+                                                statusCode = status,
+                                                message = "[FAKE->APP] Execute write response sent. status=$status"
+                                        )
+                                }
+                        }
                 }
 
         private val advertiseCallback =
@@ -625,6 +828,34 @@ class BleEmulatorManager(
                                                         "ADVERTISE_FAILED_FEATURE_UNSUPPORTED"
                                                 else -> "UNKNOWN"
                                         }
+
+                                if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) {
+                                        when (currentRetryMode) {
+                                                AdvertiseRetryMode.FULL_FRAME_WITH_NAME -> {
+                                                        emitLog(
+                                                                source = LogSource.ADVERTISER,
+                                                                operation = LogOperation.START_ADVERTISE,
+                                                                message = "[FAKE ADVERTISER] DATA_TOO_LARGE. Retry without device name but keep full frame."
+                                                        )
+                                                        currentRetryMode = AdvertiseRetryMode.FULL_FRAME_NO_NAME
+                                                        currentProfile?.let { startAdvertisingInternal(it) }
+                                                        return
+                                                }
+                                                AdvertiseRetryMode.FULL_FRAME_NO_NAME -> {
+                                                        emitLog(
+                                                                source = LogSource.ADVERTISER,
+                                                                operation = LogOperation.START_ADVERTISE,
+                                                                message = "[FAKE ADVERTISER] DATA_TOO_LARGE again. Fallback to original manufacturer data."
+                                                        )
+                                                        currentRetryMode = AdvertiseRetryMode.ORIGINAL
+                                                        currentProfile?.let { startAdvertisingInternal(it) }
+                                                        return
+                                                }
+                                                AdvertiseRetryMode.ORIGINAL -> {
+                                                        // Fallback failed too
+                                                }
+                                        }
+                                }
 
                                 _emulatorState.value = EmulatorState.ERROR
 
@@ -707,6 +938,13 @@ class BleEmulatorManager(
 
                 createGattDatabase(profile)
 
+                currentProfile = profile
+                currentRetryMode = AdvertiseRetryMode.FULL_FRAME_WITH_NAME
+                startAdvertisingInternal(profile)
+        }
+
+        @SuppressLint("MissingPermission")
+        private fun startAdvertisingInternal(profile: CapturedBleProfile) {
                 val mainServiceUuid =
                         profile.advertiseServiceUuids.firstOrNull() ?: profile.services.firstOrNull()?.uuid
 
@@ -742,19 +980,30 @@ class BleEmulatorManager(
                 /*
                  * Scan response: chứa device name + manufacturer data nếu đủ dung lượng.
                  */
+                val includeName = currentRetryMode == AdvertiseRetryMode.FULL_FRAME_WITH_NAME && !emulatorDeviceName.isNullOrBlank()
                 val scanResponseBuilder =
                         AdvertiseData.Builder()
-                                .setIncludeDeviceName(!emulatorDeviceName.isNullOrBlank())
+                                .setIncludeDeviceName(includeName)
                                 .setIncludeTxPowerLevel(false)
 
-                profile.manufacturerData.forEach { (id, bytes) ->
+                val frameNumber = extractFrameNumber(profile)
+
+                val manufacturerDataForAdvertise: Map<Int, ByteArray> =
+                        if (currentRetryMode != AdvertiseRetryMode.ORIGINAL && !frameNumber.isNullOrBlank()) {
+                                val originalId = profile.manufacturerData.keys.firstOrNull() ?: 21300
+                                mapOf(originalId to frameNumber.toByteArray(Charsets.UTF_8))
+                        } else {
+                                profile.manufacturerData
+                        }
+
+                manufacturerDataForAdvertise.forEach { (id, bytes) ->
                         scanResponseBuilder.addManufacturerData(id, bytes)
+
                         emitLog(
                                 source = LogSource.ADVERTISER,
                                 operation = LogOperation.START_ADVERTISE,
                                 payload = bytes,
-                                message =
-                                        "[FAKE ADVERTISER] Add manufacturerData. id=$id, len=${bytes.size}, utf8=${BlePayloadUtils.tryUtf8Preview(bytes)}"
+                                message = "[FAKE ADVERTISER] Add manufacturerData. id=$id, len=${bytes.size}, utf8=${BlePayloadUtils.tryUtf8Preview(bytes)}"
                         )
                 }
 
@@ -781,7 +1030,7 @@ class BleEmulatorManager(
                         source = LogSource.ADVERTISER,
                         operation = LogOperation.START_ADVERTISE,
                         message =
-                                "[FAKE ADVERTISER] Calling startAdvertising. mainServiceUuid=$mainServiceUuid, includeName=${!emulatorDeviceName.isNullOrBlank()}, emulatorName=$emulatorDeviceName, manufacturerDataCount=${profile.manufacturerData.size}"
+                                "[FAKE ADVERTISER] Calling startAdvertising. mode=$currentRetryMode, mainServiceUuid=$mainServiceUuid, includeName=$includeName, emulatorName=$emulatorDeviceName, manufacturerDataCount=${manufacturerDataForAdvertise.size}"
                 )
 
                 try {
@@ -1312,6 +1561,33 @@ class BleEmulatorManager(
                 } catch (e: Exception) {
                         "unknown"
                 }
+        }
+
+        private fun extractFrameNumber(profile: CapturedBleProfile): String? {
+                val frameCharUuid = "041d5a06-e35f-42d3-92c8-0d421186d2f3"
+                val bikeJsonCharUuid = "018e6a6f-4bda-7b07-8586-1298248a8d5c"
+
+                profile.services.forEach { service ->
+                        service.characteristics.forEach { char ->
+                                if (char.uuid.equals(frameCharUuid, ignoreCase = true)) {
+                                        val text = BlePayloadUtils.tryUtf8Preview(char.value)?.trim() ?: ""
+                                        if (text.startsWith("RL") && text.length >= 10) {
+                                                return text
+                                        }
+                                }
+
+                                if (char.uuid.equals(bikeJsonCharUuid, ignoreCase = true)) {
+                                        val text = BlePayloadUtils.tryUtf8Preview(char.value) ?: ""
+                                        val match = Regex("\"frame\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                                        val frame = match?.groupValues?.getOrNull(1)
+                                        if (!frame.isNullOrBlank()) {
+                                                return frame
+                                        }
+                                }
+                        }
+                }
+
+                return null
         }
 
         private fun isCriticalEmptyCharacteristic(serviceUuid: String?, charUuid: String?): Boolean {

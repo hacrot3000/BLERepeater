@@ -75,7 +75,8 @@ class RealGattCaptureManager(private val context: Context) : RealGattBridge {
 
                     if (newState == BluetoothProfile.STATE_CONNECTED) {
                         _captureState.value = CaptureState.CONNECTED
-                        Log.d("RealGattCaptureManager", "Đã kết nối, bắt đầu discover services...")
+                        Log.d("RealGattCaptureManager", "Đã kết nối, request MTU 247 rồi discover services...")
+                        gatt.requestMtu(247)
                         _captureState.value = CaptureState.DISCOVERING_SERVICES
                         gatt.discoverServices()
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -183,6 +184,11 @@ class RealGattCaptureManager(private val context: Context) : RealGattBridge {
                     val charUuid = characteristic.uuid.toString()
                     val value = characteristic.value ?: byteArrayOf()
                     handleCharacteristicChanged(serviceUuid, charUuid, value)
+                }
+
+                override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                    super.onMtuChanged(gatt, mtu, status)
+                    Log.d("RealGattCaptureManager", "onMtuChanged: mtu=$mtu, status=$status")
                 }
             }
 
